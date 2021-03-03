@@ -15,6 +15,7 @@ from datetime import datetime
 from re import MULTILINE
 import xmlrpclib
 import trac2down
+import time
 
 """
 What
@@ -62,7 +63,8 @@ if (method == 'api'):
     gitlab_url = config.get('target', 'url')
     gitlab_access_token = config.get('target', 'access_token')
     dest_ssl_verify = config.getboolean('target', 'ssl_verify')
-    overwrite = False
+    #overwrite = False
+    overwrite = config.getboolean('target', 'overwrite')
 elif (method == 'direct'):
     print("importing direct")
     from gitlab_direct import Connection, Issues, Notes, Milestones
@@ -104,6 +106,8 @@ matcher_changeset2 = re.compile(pattern_changeset2)
 def convert_xmlrpc_datetime(dt):
     return datetime.strptime(str(dt), "%Y%m%dT%H:%M:%S")
 
+def convert_json_datetime(dt):
+    return datetime.strptime(str(dt), "%Y%m%dT%H:%M:%S").strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def format_changeset_comment(m):
     return 'In changeset ' + m.group(1) + ':\n> ' + m.group(3).replace('\n', '\n> ')
@@ -140,8 +144,11 @@ def create_issue_header(author, created, updated=None, is_comment=False):
         modified)
 
 def convert_issues(source, dest, dest_project_id, only_issues=None, blacklist_issues=None):
-    if overwrite and (method == 'direct'):
+    if overwrite:
         dest.clear_issues(dest_project_id)
+	print("Wait 10 seconds before adding new issues")
+	time.sleep(10)
+	print("Time elapsed, starting import")
 
     milestone_map_id={}
 
@@ -264,16 +271,21 @@ def convert_issues(source, dest, dest_project_id, only_issues=None, blacklist_is
 
         if src_ticket_data['owner'] != '':
             try:
-                new_issue.assignee = dest.get_user_id(users_map[src_ticket_data['owner']])
+                new_issue.assignee = dest.get_user_id(users_map.get(src_ticket_data['owner'],default_user))
             except KeyError:
                 new_issue.assignee = dest.get_user_id(default_user)
+
+  	if (method == 'api'):
+	        new_issue.created_at = convert_json_datetime(src_ticket[1])
+		print("Trying to get author from user map: %s"%src_ticket_reporter)
+       		new_issue.author = dest.get_user_id(users_map.get(src_ticket_reporter, default_user))
         # Additional parameters for direct access
-        if (method == 'direct'):
-            new_issue.created_at = convert_xmlrpc_datetime(src_ticket[1])
+        elif (method == 'direct'):
+#            new_issue.created_at = convert_xmlrpc_datetime(src_ticket[1])
             new_issue.updated_at = convert_xmlrpc_datetime(src_ticket[2])
             new_issue.project = dest_project_id
             new_issue.state = new_state
-            new_issue.author = dest.get_user_id(users_map.get(src_ticket_reporter, default_user))
+#            new_issue.author = dest.get_user_id(users_map.get(src_ticket_reporter, default_user))
             if overwrite:
                 new_issue.iid = src_ticket_id
             else:
@@ -284,6 +296,7 @@ def convert_issues(source, dest, dest_project_id, only_issues=None, blacklist_is
             milestone = src_ticket_data['milestone']
             if milestone and milestone in milestone_map_id:
                 new_issue.milestone = milestone_map_id[milestone]
+#	print("Creating issue: %s: %s" % (new_issue.author,new_issue.created_at) )
         new_ticket = dest.create_issue(dest_project_id, new_issue)
 
         changelog = source.ticket.changeLog(src_ticket_id)
@@ -293,11 +306,11 @@ def convert_issues(source, dest, dest_project_id, only_issues=None, blacklist_is
         newowner = None
         for change in changelog:
             # New line
-            change_time = str(convert_xmlrpc_datetime(change[0]))
+            change_time = convert_json_datetime(change[0])
             change_type = change[2]
             print(("  %s by %s (%s -> %s)" % (change_type, change[1], change[3][:40].replace("\n", " "), change[4][:40].replace("\n", " "))).encode("ascii", "replace"))
             #assert attachment is None or change_type == "comment", "an attachment must be followed by a comment"
-            author = dest.get_user_id(users_map[change[1]])
+            author = dest.get_user_id(users_map.get(change[1],default_user))
             if change_type == "attachment":
                 # The attachment will be described in the next change!
                 is_attachment = True
@@ -308,23 +321,31 @@ def convert_issues(source, dest, dest_project_id, only_issues=None, blacklist_is
                     continue
                 if (desc != ''):
                     desc = fix_wiki_syntax(change[4])
-                note = Notes(
-                    note=create_issue_header(author=change[1], created=change[0], is_comment=True) + trac2down.convert(desc, '/issues/', False)
+                    note = Notes(
+                        note=create_issue_header(author=change[1], created=change[0], is_comment=True) + trac2down.convert(desc, '/issues/', False)
                 )
                 if attachment is not None :
                     note.attachment_name = attachment[4]  # name of attachment
                     binary_attachment = source.ticket.getAttachment(src_ticket_id, attachment[4].encode('utf8')).data
+
+                print("User: %s map entry '%s' from gitlab: '%s'"%(change[1],users_map.get(change[1],default_user),author))
+
                 try:
-                    note.author = dest.get_user_id(users_map[change[1]])
-                    if note.author == None:
+                    note.author = dest.get_user_id(users_map.get(change[1],default_user))
+                    if note.author is None:
+		       print("None check succeeded, trying default author: '%s' / '%s' "%(default_user,dest.get_user_id(default_user)))
                        note.author = dest.get_user_id(default_user)
                 except KeyError:
+		    print("KeyError")
                     note.author = dest.get_user_id(default_user)
-                if (method == 'direct'):
+		print("Note author: %s"%note.author)
+                if (method == 'api'):
+    		    note.created_at = convert_json_datetime(change[0])
+		elif (method == 'direct'):
                     note.created_at = convert_xmlrpc_datetime(change[0])
                     note.updated_at = convert_xmlrpc_datetime(change[0])
                     try:
-                        note.author = dest.get_user_id(users_map[change[1]])
+                        note.author = dest.get_user_id(users_map.get(change[1],default_user))
                     except KeyError:
                         note.author = dest.get_user_id(default_user)
                     if (is_attachment):
@@ -339,7 +360,7 @@ def convert_issues(source, dest, dest_project_id, only_issues=None, blacklist_is
                     # workaround #3 dest.update_issue_property(dest_project_id, issue, author, change_time, 'labels')
 
                 # we map here the various statii we have in trac to just 2 statii in gitlab (open or close), so loose some information
-                if change[4] in ['new', 'assigned', 'analyzed', 'vendor', 'reopened'] :
+                if change[4] in ['new', 'assigned', 'analyzed', 'vendor', 'reopened', 'accepted'] :
                     newstate = 'open'
                 elif change[4] in ['closed'] :
                     newstate = 'closed'
@@ -375,7 +396,7 @@ def convert_wiki(source, dest, dest_project_id):
                 name = 'home'
             converted = trac2down.convert(page, os.path.dirname('/wikis/%s' % name))
             try:
-                wikiauthor = dest.get_user_id(users_map[info['author']])
+                wikiauthor = dest.get_user_id(users_map.get(info['author'],default_user))
                 if wikiauthor == None:
                        wikiauthor = dest.get_user_id(default_user)
             except KeyError:
@@ -386,7 +407,7 @@ def convert_wiki(source, dest, dest_project_id):
                     print(attachment)
                     binary_attachment = source.wiki.getAttachment(attachment).data
                     try:
-                        attachment_path = dest.create_wiki_attachment(dest_project_id, users_map[info['author']], convert_xmlrpc_datetime(info['lastModified']), attachment, binary_attachment)
+                        attachment_path = dest.create_wiki_attachment(dest_project_id, users_map.get(info['author'],default_user), convert_xmlrpc_datetime(info['lastModified']), attachment, binary_attachment)
                     except KeyError:
                         attachment_path = dest.create_wiki_attachment(dest_project_id, default_user, convert_xmlrpc_datetime(info['lastModified']), attachment, binary_attachment)
                     attachment_name = attachment.split('/')[-1]

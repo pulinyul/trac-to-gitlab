@@ -62,6 +62,7 @@ class Connection(object):
         for user in users:
             if user['username'] == username:
                 return user["id"]
+	return None
 
     def project_by_name(self, project_name):
         projects = self.get("/projects")
@@ -120,16 +121,44 @@ class Connection(object):
     def post_json(self, url_postfix, data, **keywords):
         completed_url = self._complete_url(url_postfix, keywords)
         payload = json.dumps(data)
+        headers = self._request_headers(keywords)
+#	data['PRIVATE-TOKEN'] = headers['PRIVATE-TOKEN']
         r = requests.post(completed_url, data=data, verify=self.verify)
+	print("Posting to %s"%r.url)
+	print("with header %s"%headers)
+	print("data: %s"%data)
         j = r.json()
+	print("Reply: %s"%j)
         return j
+
+    def delete(self, url_postfix, **keywords):
+	completed_url = self._complete_url(url_postfix, keywords)
+#	payload = json.dumps(data)
+	headers = self._request_headers(keywords)
+	r = requests.delete(completed_url, headers=headers, verify=self.verify)
+	j = r.text
+	return j
 
     def create_issue(self, dest_project_id, new_issue):
         if hasattr(new_issue, 'milestone'):
             new_issue.milestone_id = new_issue.milestone
         if hasattr(new_issue, 'assignee'):
             new_issue.assignee_id = new_issue.assignee
-        new_ticket = self.post_json("/projects/:id/issues", new_issue.__dict__, id=dest_project_id)
+        if hasattr(new_issue, 'author'):
+#            author = new_issue.author
+	    #also delete dictionary entry
+	    userid = new_issue.author
+#	    print("author assigned: ", author)
+#	    userid = self.get_user_id(author)
+	    print("user id: %s" % userid)
+	    delattr(new_issue,'author')
+            token = self.get_user_imperstoken(userid)
+	    print(userid, " impersonation token acquired: ", token)
+        else:
+            token = self.access_token
+	    print("Using default token: ", token)
+
+        new_ticket = self.post_json("/projects/:id/issues",new_issue.__dict__, id=dest_project_id, token=token)
         new_ticket_id  = new_issue.iid
         # setting closed in create does not work -- limitation in gitlab
         if new_issue.state == 'closed': self.close_issue(dest_project_id,new_ticket_id)
@@ -161,17 +190,21 @@ class Connection(object):
            note.attachment_name = note.attachment_name.encode("ascii", "replace")
            r = self.upload_file(project_id, note.author, note.attachment_name, binary_attachment)
            relative_path_start_index = r['markdown'].index('/')
-           relative_path = r['markdown'][:relative_path_start_index] + '..' + r['markdown'][relative_path_start_index:]
+           #relative_path = r['markdown'][:relative_path_start_index] + '..' + r['markdown'][relative_path_start_index:]
+           relative_path = r['markdown']
            note.note = "Attachment added: " + relative_path + '\n\n' + note.note
            if origname != note.attachment_name :
                note.note += '\nFilename changed during trac to gitlab conversion. Original filename: ' + origname
 
+	userid = note.author
+	token = self.get_user_imperstoken(userid)
         new_note_data = {
             "id" : project_id,
             "issue_id" :ticket.iid,
-            "body" : note.note
+            "body" : note.note,
+	    "created_at" : note.created_at
         }
-        self.post_json( "/projects/:project_id/issues/:issue_id/notes", new_note_data, project_id=project_id, issue_id=ticket.iid)
+        self.post_json( "/projects/:project_id/issues/:issue_id/notes", new_note_data, project_id=project_id, issue_id=ticket.iid, token=token)
 
     def get_user_imperstoken(self, userid) :
         if userid in self.impers_tokens :
@@ -182,7 +215,9 @@ class Connection(object):
             'expires_at' : (datetime.date.today() + datetime.timedelta(days = 1)).strftime('%Y-%m-%dT%H:%M:%S.%f'),
             'scopes[]' : 'api'
             }
+	print(json.dumps(data))
         r = self.post_json('/users/:user_id/impersonation_tokens', data, user_id = userid)
+	print json.dumps(r)
         self.impers_tokens[userid] = r['token'];
         return r['token']
 
@@ -194,7 +229,7 @@ class Connection(object):
             print '  use previous upload of file', filename
             return self.uploaded_files[h]
 
-        print '  upload file', filename
+        print '  upload file', filename, ' author: ', author, 'token: ', token
         r = self.post("/projects/:project_id/uploads", None, files = {'file' : (filename, filedata)}, project_id = project_id, token = token)
         self.uploaded_files[h] = r;
         return r
@@ -203,9 +238,32 @@ class Connection(object):
         new_note_data = {"state_event": "close"}
         self.put("/projects/:project_id/issues/:issue_id", new_note_data, project_id=project_id, issue_id=ticket_id)
 
+    def clear_issues(self, project_id):
+	url_postfix = "/projects/:project_id/issues"
+	keywords = {'project_id':project_id}
+	completed_url = self._complete_url(url_postfix, keywords)+"&per_page=50"
+        r = requests.get(completed_url, verify=self.verify)
+#        issues_page = r.json()
+#        return json
+#	issues_page = self.get("/projects/:project_id/issues",project_id=project_id)
+	pagesStr = r.headers['x-total-pages']
+	pages = int(pagesStr)
+	print("Deleting existing issues on pages:", pagesStr, " ", pages)
+	for page in range(pages):
+		issues_page = self.get("/projects/:project_id/issues",project_id=project_id,page=page)
+		for issue in issues_page:
+			issue_iid = issue["iid"]
+			r = self.delete("/projects/:id/issues/:issue_iid", id=project_id, issue_iid=issue_iid)
+			print "Deleted issue: ", issue_iid, " Response: ", r
+	print "Deleting all issues finished"
+
     def _complete_url(self, url_postfix, keywords):
         url_postfix_with_params = self._url_postfix_with_params(url_postfix, keywords)
-        complete_url = "%s%s?private_token=%s" % (self.url, url_postfix_with_params, self.access_token)
+	if 'token' in keywords:
+	    #complete_url = "%s%s" % (self.url, url_postfix_with_params)
+	    complete_url = "%s%s?private_token=%s" % (self.url, url_postfix_with_params, keywords['token'])
+	else:
+	    complete_url = "%s%s?private_token=%s" % (self.url, url_postfix_with_params, self.access_token)
         return complete_url
 
     def _url_postfix_with_params(self, url_postfix, keywords):
